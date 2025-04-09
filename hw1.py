@@ -1,5 +1,9 @@
 import os
 from openai import AzureOpenAI
+from gt import correct_category
+from collections import defaultdict
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # TODO: Edge cases of LLM returns other outputs than split/no split
 # TODO: use getenv to read .env file
@@ -26,7 +30,26 @@ client_model2 = AzureOpenAI(
     api_version=OPENAI_API_VERSION_4o,
     azure_endpoint=azure_openai_endpoint_4o
 )
+# ---Test Conn--
+def test_client_connection(client, model_name):
+    try:
+        print(f"Testing connection to model: {model_name} ...")
+        response = client.chat.completions.create(
+            model=model_name,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "You are a simple echo bot."},
+                {"role": "user", "content": "Hello"}
+            ]
+        )
+        test_output = response.choices[0].message.content
+        print(f"✅ Connection to {model_name} successful. Response: {test_output}")
+    except Exception as e:
+        print(f"❌ Connection to {model_name} failed: {e}")
 
+
+test_client_connection(client_model1, "gpt-35-16k")
+test_client_connection(client_model2, "gpt-4o-mini")
 # --- Static Configuration ---
 
 SYSTEM_MESSAGE = (
@@ -194,6 +217,7 @@ def generate_category_predictions(tickets):
                 )
                 llm_raw = response.choices[0].message.content.strip()
                 normalized = llm_raw
+                print(llm_raw) #DEBUG
             except Exception as e:
                 llm_raw = f"Error: {str(e)}"
                 normalized = "unknown"
@@ -214,3 +238,104 @@ tickets = load_tickets("tkts_2.txt")
 category_results = generate_category_predictions(tickets)
 write_category_results_to_file(category_results, "categories.txt")
 print("categories.txt has been created.")
+
+##############################
+#######--PART_3--#############
+##############################
+
+def parse_categories_file(path="categories.txt"):
+    results = {}
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    current_ticket = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue  # skip blank lines
+        if re.match(r"^\d+:$", line):
+            current_ticket = int(line[:-1])
+            results[current_ticket] = []
+        elif current_ticket is not None and ", " in line and ":" in line:
+            try:
+                model_temp, category = line.split(":")
+                model, temp = model_temp.split(", ")
+                category = category.strip().lower()
+                results[current_ticket].append((model, float(temp), category))
+            except ValueError:
+                continue  # bad line format
+    return results
+
+def analyze_categories(results):
+    stats_per_model = defaultdict(lambda: [0, 0])  # model: [correct, total]
+    stats_per_temp = defaultdict(lambda: [0, 0])   # temperature: [correct, total]
+    majority_correct = 0
+    total_tickets = 0
+
+    ticket_stats = {}
+
+    for ticket_num, predictions in results.items():
+        total_tickets += 1
+        correct_count = 0
+        category_counts = defaultdict(int)
+
+        for model, temp, category in predictions:
+            stats_per_temp[temp][1] += 1
+            stats_per_model[model][1] += 1
+
+            is_correct = correct_category(ticket_num, category)
+            if is_correct:
+                correct_count += 1
+                stats_per_temp[temp][0] += 1
+                stats_per_model[model][0] += 1
+
+            if category != "unknown":
+                category_counts[category] += 1
+
+        majority = max(category_counts.values()) if category_counts else 0
+        majority_label = "correct" if majority >= 4 else "incorrect"
+        if majority_label == "correct":
+            majority_correct += 1
+
+        ticket_stats[ticket_num] = {
+            "correct_count": correct_count,
+            "majority": majority_label
+        }
+
+    return ticket_stats, stats_per_temp, stats_per_model, majority_correct, total_tickets
+
+def write_statistics_to_file(ticket_stats, stats_per_temp, stats_per_model, majority_correct, total_tickets, output_path="statistics.txt"):
+    with open(output_path, "w", encoding="utf-8") as f:
+        # Write per-ticket stats
+        for ticket_num in sorted(ticket_stats.keys()):
+            f.write(f"{ticket_num}:\n")
+            f.write(f"number correct: {ticket_stats[ticket_num]['correct_count']}\n")
+            f.write(f"majority voting: {ticket_stats[ticket_num]['majority']}\n\n")
+
+        # Summary
+        f.write("summary\n")
+        for temp in sorted(stats_per_temp.keys()):
+            correct, total = stats_per_temp[temp]
+            pct = (correct / total) * 100 if total > 0 else 0
+            f.write(f"percent correct temperature = {temp}: {pct:.2f}\n")
+
+        for model in sorted(stats_per_model.keys()):
+            correct, total = stats_per_model[model]
+            pct = (correct / total) * 100 if total > 0 else 0
+            f.write(f"percent correct model = {model}: {pct:.2f}\n")
+
+        # Totals
+        total_correct = sum(c for c, _ in stats_per_model.values())
+        total_predictions = sum(t for _, t in stats_per_model.values())
+        overall_pct = (total_correct / total_predictions) * 100 if total_predictions > 0 else 0
+        majority_pct = (majority_correct / total_tickets) * 100 if total_tickets > 0 else 0
+
+        f.write(f"percent correct total: {overall_pct:.2f}\n")
+        f.write(f"percent correct majority voting: {majority_pct:.2f}\n")
+
+results = parse_categories_file("categories.txt")
+ticket_stats, temp_stats, model_stats, majority_correct, total_tickets = analyze_categories(results)
+write_statistics_to_file(ticket_stats, temp_stats, model_stats, majority_correct, total_tickets, "statistics.txt")
+print("✅ statistics.txt created.")
+
+
