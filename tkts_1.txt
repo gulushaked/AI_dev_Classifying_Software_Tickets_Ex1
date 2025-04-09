@@ -1,0 +1,20 @@
+1: The login button doesn't respond on mobile devices.
+2: Reports show outdated data, and charts fail to render on Safari.
+3: Passwords are visible in plain text when typing, and reset emails are not sent.
+4: The app crashes after submitting a long feedback form.
+5: Notifications do not appear for new messages.
+6: The dashboard loads slowly, and filters don't apply correctly.
+7: Dropdown menus overlap other interface elements.
+8: Users without billing permissions can still access the payment history.
+9: The file download feature is missing.
+10: Clicking 'Save' sometimes fails silently, and session timeout is not enforced.
+11: Invoices are calculated incorrectly for discounted items.
+12: User profile pictures are not saved, and upload progress never completes.
+13: MFA setup is not available, and password complexity rules are not enforced.
+14: On small screens, modals are cut off and buttons are misaligned.
+15: Exported reports are empty, and the export button disappears randomly.
+16: The buttons on the dashboard are misaligned after resizing the window.
+17: User roles are not saving correctly; some users are getting access to admin features.
+18: Clicking Submit twice causes duplicate records to be created.
+19: Some reports show incorrect calculations, and the interface layout breaks when resizing the window.
+20: Search results are incorrect. When I apply filters the page is unresponsive.

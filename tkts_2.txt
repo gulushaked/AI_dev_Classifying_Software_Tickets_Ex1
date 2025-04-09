@@ -1,0 +1,19 @@
+1: Users without verification can access the internal messaging system.
+2: PDF export is missing from the invoice section.
+3: Profile pictures are not displayed on user cards.
+4: Login sessions expire too quickly.
+5: The app freezes when switching between tabs quickly.
+6: After password reset, login fails on the first attempt.
+7: Push notifications arrive with a delay.
+8: Reports show incorrect totals in the sales summary.
+9: The file selection dialog does not appear on Safari.
+10: Auto-save does not trigger after editing the description field.
+11: Charts are not sorted chronologically.
+12: The search bar overlaps with the menu.
+13: Admin users are unable to delete archived records.
+14: The sidebar is collapsed by default on small screens.
+15: Email notifications are not sent after changing SMTP settings.
+16: Users without admin privileges can access restricted settings.
+17: Email notifications are not being sent after changing SMTP settings.
+18: The app crashes when uploading large files.
+19: Some users are missing transaction history from last month.
