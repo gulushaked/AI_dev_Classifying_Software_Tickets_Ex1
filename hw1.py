@@ -4,6 +4,9 @@ from gt import correct_category
 from collections import defaultdict
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# Thread-safe structure to collect results
+import threading
+import time
 
 # TODO: Edge cases of LLM returns other outputs than split/no split
 # TODO: use getenv to read .env file
@@ -48,8 +51,8 @@ def test_client_connection(client, model_name):
         print(f"❌ Connection to {model_name} failed: {e}")
 
 
-test_client_connection(client_model1, "gpt-35-16k")
-test_client_connection(client_model2, "gpt-4o-mini")
+#test_client_connection(client_model1, "gpt-35-16k")
+#test_client_connection(client_model2, "gpt-4o-mini")
 # --- Static Configuration ---
 
 SYSTEM_MESSAGE = (
@@ -102,7 +105,7 @@ def load_ground_truth(path):
                 truth[int(num)] = label.strip().lower()
     return truth
 
-"""
+
 # --- LLM Output Cleaning ---
 def normalize_response(resp):
     resp = resp.lower().strip()
@@ -115,7 +118,7 @@ def normalize_response(resp):
     else:
         return "unknown"
 
-"""
+
 
 # Collect results in a dict like {ticket_num: [(model, temp, label, response), ...]}
 def generate_split_predictions(tickets):
@@ -135,7 +138,7 @@ def generate_split_predictions(tickets):
                     ]
                 )
                 llm_raw = response.choices[0].message.content.strip()
-                normalized = llm_raw
+                normalized = normalize_response(llm_raw)
             except Exception as e:
                 llm_raw = f"Error: {str(e)}"
                 normalized = "unknown"
@@ -199,6 +202,69 @@ MODEL_TEMP_CATEGORY_CONFIGS = [
     (MODEL_4o, 0.9, client_model2)
 ]
 
+ALLOWED_CATEGORIES = {
+    "interface",
+    "lacking feature",
+    "logic defect",
+    "data",
+    "security and access control",
+    "configuration",
+    "stability",
+    "performance"
+}
+
+def normalize_category_response(resp):
+    resp = resp.lower().strip()
+    for cat in ALLOWED_CATEGORIES:
+        if cat in resp:
+            return cat
+    return "unknown"
+
+
+def generate_category_predictions_threaded(tickets, max_workers=10):
+    results_lock = threading.Lock()
+    results = defaultdict(list)
+
+    def call_model(ticket_num, ticket_text, model, temp, client):
+        """
+        Function to run in each thread: sends the request and returns the result.
+        """
+        prompt = CATEGORY_PROMPT_TEMPLATE.format(ticket=ticket_text)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temp,
+                messages=[
+                    {"role": "system", "content": CATEGORY_SYSTEM_MESSAGE},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            llm_raw = response.choices[0].message.content.strip()
+            normalized = normalize_category_response(llm_raw)
+        except Exception as e:
+            llm_raw = f"Error: {str(e)}"
+            normalized = "unknown"
+
+        return ticket_num, model, temp, normalized, llm_raw
+
+    # Launch all requests in parallel using a thread pool
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for ticket_num, ticket_text in tickets.items():
+            for model, temp, client in MODEL_TEMP_CATEGORY_CONFIGS:
+                futures.append(
+                    executor.submit(call_model, ticket_num, ticket_text, model, temp, client)
+                )
+
+        # As each one completes, add it to results
+        for future in as_completed(futures):
+            ticket_num, model, temp, normalized, llm_raw = future.result()
+            with results_lock:
+                results[ticket_num].append((model, temp, normalized, llm_raw))
+
+    return results
+
+
 def generate_category_predictions(tickets):
     results = {}
 
@@ -233,12 +299,17 @@ def write_category_results_to_file(results, output_path="categories.txt"):
             for model, temp, category, llm_response in results[ticket_num]:
                 f.write(f"{model}, {temp}: {category}\n")
                 f.write(f"LLM response: {llm_response}\n\n")
-
-tickets = load_tickets("tkts_2.txt")
-category_results = generate_category_predictions(tickets)
+""""
+tickets = load_tickets("tkts_2_short.txt")
+#category_results = generate_category_predictions(tickets)  --- Non multithreaded version
+start_time = time.time()
+category_results = generate_category_predictions_threaded(tickets, max_workers=10)
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"⏱️ Time taken for Part 2 (multithreaded): {elapsed_time:.2f} seconds")
 write_category_results_to_file(category_results, "categories.txt")
 print("categories.txt has been created.")
-
+"""
 ##############################
 #######--PART_3--#############
 ##############################
@@ -289,9 +360,11 @@ def analyze_categories(results):
                 stats_per_temp[temp][0] += 1
                 stats_per_model[model][0] += 1
 
-            if category != "unknown":
-                category_counts[category] += 1
+                if category != "unknown":
+                    category_counts[category] += 1
 
+        if ticket_num == 6:
+            print(category_counts)
         majority = max(category_counts.values()) if category_counts else 0
         majority_label = "correct" if majority >= 4 else "incorrect"
         if majority_label == "correct":
@@ -301,7 +374,8 @@ def analyze_categories(results):
             "correct_count": correct_count,
             "majority": majority_label
         }
-
+        if ticket_num == 6:
+            print(ticket_stats)
     return ticket_stats, stats_per_temp, stats_per_model, majority_correct, total_tickets
 
 def write_statistics_to_file(ticket_stats, stats_per_temp, stats_per_model, majority_correct, total_tickets, output_path="statistics.txt"):
