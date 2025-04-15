@@ -3,7 +3,7 @@ def correct_category(num: int, category: str) -> bool:
     GT = {1: 'security and access control',
           2: 'lacking feature',
           3: 'interface',
-          4: 'security and access control',
+          4: 'configuration',
           5: 'stability',
           6: 'logic defect',
           7: 'performance',

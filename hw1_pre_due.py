@@ -1,43 +1,28 @@
 import os
 from dotenv import load_dotenv
+import sys
 from openai import AzureOpenAI
 from gt import correct_category
 from collections import defaultdict
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+from utils import *
 
-# --- Global variables defining OpenAI's deployments we use for the assignment ---
+# TODO: Change to non multithreading
+# TODO: Remove back to tkts_1/2 with no test
+# TODO: Fix logic in correct category in part3
+# TODO: Wrapp getenv with exception handling for avoiding failure when running as a script
+# TODO: Prompt script runner with name of files were created and their path
+# --- Get environment variables contents ---
 MODEL = 'gpt-35-16k'
 OPENAI_API_VERSION = '2023-12-01-preview'
 MODEL_4o = 'gpt-4o-mini'
 OPENAI_API_VERSION_4o = '2024-08-01-preview'
 
-# ---Test Conn Function--
-def test_client_connection(client, model_name):
-    """
-    Tests the connection to a given Azure OpenAI model.
-    """
-    try:
-        print(f"Testing connection to model '{model_name}'...")
-        response = client.chat.completions.create(
-            model=model_name,
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": "You are a diagnostic assistant."},
-                {"role": "user", "content": "Say hello."}
-            ]
-        )
-        reply = response.choices[0].message.content.strip()
-        print(f"Connection to '{model_name}' successful.")
-    except Exception as e:
-        raise RuntimeError(f"Failed to connect to model '{model_name}': {e}")
 
 
-
-
-# --- Messages issued for parts 1 & 2 ---
-
-## System & User prompts for part 1
-### Note: We use system messages as well as user's to provide better context to the model
 SYSTEM_MESSAGE = (
     """ You are an expert software ticket classifier.
         Your job is to read a bug ticket and decide if it contains one issue or multiple distinct issues."""
@@ -60,7 +45,83 @@ Now analyze the following ticket and respond with only: "split", "no-split".
 Ticket:
 "{ticket}"
 """
-## System & User prompts for part 2
+
+
+# --- File Readers ---
+
+def load_tickets(path):
+    tickets = {}
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if ':' in line:
+                num, text = line.strip().split(':', 1)
+                tickets[int(num)] = text.strip()
+    return tickets
+
+# --- LLM Output Cleaning ---
+def normalize_response(resp):
+    resp = resp.lower().strip()
+    if "split" in resp and "no-split" not in resp:
+        return "split"
+    elif "no-split" in resp:
+        return "no-split"
+    elif resp in ["split", "no-split", "unknown"]:
+        return resp
+    else:
+        return "unknown"
+
+
+
+# Collect results in a dict like {ticket_num: [(model, temp, label, response), ...]}
+def generate_split_predictions(tickets, model_configs):
+    results = {}
+
+    for ticket_num, text in tickets.items():
+        model_results = []
+        for model, temp, client in model_configs:
+            prompt = PROMPT_TEMPLATE.format(ticket=text)
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    temperature=temp,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_MESSAGE},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                llm_raw = response.choices[0].message.content.strip()
+                normalized = normalize_response(llm_raw)
+            except Exception as e:
+                llm_raw = f"Error: {str(e)}"
+                normalized = "unknown"
+
+            model_results.append((model, temp, normalized, llm_raw))
+        results[ticket_num] = model_results
+    return results
+
+# Save results to split.txt in required format
+def write_split_results_to_file(results, output_path="split.txt"):
+    with open(output_path, "w", encoding="utf-8") as f:
+        for ticket_num in sorted(results.keys()):
+            f.write(f"{ticket_num}:\n")
+            for model, temp, split_label, llm_response in results[ticket_num]:
+                f.write(f"{model}, {temp}: {split_label}\n")
+                f.write(f"LLM response: {llm_response}\n\n")  # blank line between responses
+
+############################
+#######--PART_2#############
+############################
+ALLOWED_CATEGORIES = {
+        "interface",
+        "lacking feature",
+        "logic defect",
+        "data",
+        "security and access control",
+        "configuration",
+        "stability",
+        "performance"
+    }
+
 CATEGORY_SYSTEM_MESSAGE = (
     "You are an expert in software bug categorization. "
     "You must assign each ticket to one of the following categories: "
@@ -85,40 +146,6 @@ Ticket:
 "{ticket}"
 """
 
-# --- File Readers ---
-def load_tickets(path):
-    tickets = {}
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if ':' in line:
-                num, text = line.strip().split(':', 1)
-                tickets[int(num)] = text.strip()
-    return tickets
-
-# --- LLM Output Cleaning ---
-
-ALLOWED_CATEGORIES = {
-        "interface",
-        "lacking feature",
-        "logic defect",
-        "data",
-        "security and access control",
-        "configuration",
-        "stability",
-        "performance"
-    }
-
-def normalize_response(resp):
-    resp = resp.lower().strip()
-    if "split" in resp and "no-split" not in resp:
-        return "split"
-    elif "no-split" in resp:
-        return "no-split"
-    elif resp in ["split", "no-split", "unknown"]:
-        return resp
-    else:
-        return "unknown"
-
 def normalize_category_response(resp):
     resp = resp.lower().strip()
     for cat in ALLOWED_CATEGORIES:
@@ -126,66 +153,52 @@ def normalize_category_response(resp):
             return cat
     return "unknown"
 
-# --- Part 1: split\no-split classification ---
 
-def generate_split_predictions(tickets, model_configs):
-    """
-    Being called after reading and processing tkts_1.txt file.
-    Collect results in a dict like {ticket_num: [(model, temp, label, response), ...]}
-    :param tickets: A python dict of the form {<number>: <issue>}
-    :param model_configs: model configurations as defined in the assignment instructions
-           for part 1
-    :return: dict like {ticket_num: [(model, temp, label, response), ...]}
-    """
-    results = {}
+def generate_category_predictions_threaded(tickets, model_temp_category_configs, max_workers=10):
+    results_lock = threading.Lock()
+    results = defaultdict(list)
 
-    for ticket_num, text in tickets.items():
-        model_results = []
-        for model, temp, client in model_configs:
-            prompt = PROMPT_TEMPLATE.format(ticket=text)
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    temperature=temp,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_MESSAGE},
-                        {"role": "user", "content": prompt}
-                    ]
+    def call_model(ticket_num, ticket_text, model, temp, client):
+        """
+        Function to run in each thread: sends the request and returns the result.
+        """
+        prompt = CATEGORY_PROMPT_TEMPLATE.format(ticket=ticket_text)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temp,
+                messages=[
+                    {"role": "system", "content": CATEGORY_SYSTEM_MESSAGE},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            llm_raw = response.choices[0].message.content.strip()
+            normalized = normalize_category_response(llm_raw)
+        except Exception as e:
+            llm_raw = f"Error: {str(e)}"
+            normalized = "unknown"
+
+        return ticket_num, model, temp, normalized, llm_raw
+
+    # Launch all requests in parallel using a thread pool
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for ticket_num, ticket_text in tickets.items():
+            for model, temp, client in model_temp_category_configs:
+                futures.append(
+                    executor.submit(call_model, ticket_num, ticket_text, model, temp, client)
                 )
-                llm_raw = response.choices[0].message.content.strip()
-                normalized = normalize_response(llm_raw)
-            except Exception as e:
-                llm_raw = f"Error: {str(e)}"
-                normalized = "unknown"
 
-            model_results.append((model, temp, normalized, normalized))
-        results[ticket_num] = model_results
+        # As each one completes, add it to results
+        for future in as_completed(futures):
+            ticket_num, model, temp, normalized, llm_raw = future.result()
+            with results_lock:
+                results[ticket_num].append((model, temp, normalized, llm_raw))
+
     return results
 
-def write_split_results_to_file(results, output_path="split.txt"):
-    """
-    Save results to split.txt in required format
-    :param results: dict like {ticket_num: [(model, temp, label, response), ...]}
-    """
-    with open(output_path, "w", encoding="utf-8") as f:
-        for ticket_num in sorted(results.keys()):
-            f.write(f"{ticket_num}:\n")
-            for model, temp, split_label, llm_response in results[ticket_num]:
-                f.write(f"{model}, {temp}: {split_label}\n")
-                f.write(f"LLM response: {llm_response}\n\n")  # blank line between responses
-
-    print(f"PART_1 : {output_path} has been generated in current directory.")
-
-# --- Part 2: categories classification ---
 
 def generate_category_predictions(tickets, model_temp_category_configs):
-    """
-    Being called after reading and processing tkts_2.txt file.
-    Collect results in a dict like {ticket_num: [(model, temp, label, response), ...]}
-    :param tickets:
-    :param model_temp_category_configs: model configurations as defined in the assignment instructions
-           for part 2. Expecting three-tuples of Each tuple = (model_name, temperature, associated_client)
-    """
     results = {}
 
     for ticket_num, text in tickets.items():
@@ -202,20 +215,17 @@ def generate_category_predictions(tickets, model_temp_category_configs):
                     ]
                 )
                 llm_raw = response.choices[0].message.content.strip()
-                normalized = normalize_category_response(llm_raw)
+                normalized = llm_raw
+                print(llm_raw) #DEBUG
             except Exception as e:
                 llm_raw = f"Error: {str(e)}"
                 normalized = "unknown"
 
-            model_results.append((model, temp, normalized, normalized))
+            model_results.append((model, temp, normalized, llm_raw))
         results[ticket_num] = model_results
     return results
 
 def write_category_results_to_file(results, output_path="categories.txt"):
-    """
-    Save results to split.txt in required format
-    :param results: dict like {ticket_num: [(model, temp, label, response), ...]}
-    """
     with open(output_path, "w", encoding="utf-8") as f:
         for ticket_num in sorted(results.keys()):
             f.write(f"{ticket_num}:\n")
@@ -223,26 +233,11 @@ def write_category_results_to_file(results, output_path="categories.txt"):
                 f.write(f"{model}, {temp}: {category}\n")
                 f.write(f"LLM response: {llm_response}\n\n")
 
-    print(f"PART_2 : {output_path} has been generated in current directory.")
-
-# --- Part 3: Analyzing LLM performance across different models and configurations ---
+##############################
+#######--PART_3--#############
+##############################
 
 def parse_categories_file(path="categories.txt"):
-    """
-    Parses the contents of a categories output file (as defined in Part 2 of the assignment)
-    and returns a dictionary mapping ticket numbers to a list of model predictions.
-    :return:
-            A dictionary where each key is a ticket number (int), and the value is a list of
-            3-tuples containing:
-                - model name
-                - temperature
-                - predicted category
-    notes:
-        - Only the prediction line (model, temperature, and category) is parsed.
-        - The raw LLM response lines are ignored.
-        - Blank lines and improperly formatted lines are skipped.
-        - Category is stripped and lowercased for consistency.
-    """
     results = {}
     with open(path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -266,19 +261,6 @@ def parse_categories_file(path="categories.txt"):
     return results
 
 def analyze_categories(results):
-    """
-    Evaluates the accuracy of LLM category predictions per ticket.
-    :param results: A dictionary mapping ticket numbers to a list of
-                   (model, temperature, category) predictions.
-
-    :return: A tuple of:
-               - ticket_stats: Per-ticket stats including number of correct predictions
-                               and majority voting result ("correct"/"incorrect").
-               - stats_per_temp: Temperature-level stats: {temp: [correct, total]}.
-               - stats_per_model: Model-level stats: {model: [correct, total]}.
-               - majority_correct: Number of tickets where majority voting was correct.
-               - total_tickets: Total number of tickets processed.
-    """
     stats_per_model = defaultdict(lambda: [0, 0])  # model: [correct, total]
     stats_per_temp = defaultdict(lambda: [0, 0])   # temperature: [correct, total]
     majority_correct = 0
@@ -304,6 +286,8 @@ def analyze_categories(results):
                 if category != "unknown":
                     category_counts[category] += 1
 
+        if ticket_num == 6:
+            print(category_counts)
         majority = max(category_counts.values()) if category_counts else 0
         majority_label = "correct" if majority >= 4 else "incorrect"
         if majority_label == "correct":
@@ -313,14 +297,11 @@ def analyze_categories(results):
             "correct_count": correct_count,
             "majority": majority_label
         }
-
+        if ticket_num == 6:
+            print(ticket_stats)
     return ticket_stats, stats_per_temp, stats_per_model, majority_correct, total_tickets
 
-def write_statistics_to_file(ticket_stats, stats_per_temp, stats_per_model,
-                             majority_correct, total_tickets, output_path="statistics.txt"):
-    """
-    Writes detailed and summary statistics to a text file in the required assignment format.
-    """
+def write_statistics_to_file(ticket_stats, stats_per_temp, stats_per_model, majority_correct, total_tickets, output_path="statistics.txt"):
     with open(output_path, "w", encoding="utf-8") as f:
         # Write per-ticket stats
         for ticket_num in sorted(ticket_stats.keys()):
@@ -349,36 +330,15 @@ def write_statistics_to_file(ticket_stats, stats_per_temp, stats_per_model,
         f.write(f"percent correct total: {overall_pct:.2f}\n")
         f.write(f"percent correct majority voting: {majority_pct:.2f}\n")
 
-    print(f"PART_3 : {output_path} has been generated in current directory.")
-
 def main():
-    """
-    Maintains the whole assignment logic. calls required functions sequentially
-    and generates: split.txt, categories.txt and statistics.txt.
-    Note: hw1 logic expects the presence of: 'tkts_1.txt', 'tkts_2.txt' and 'environment_variables'
-    files within the same directory it is being executed in.
-    """
-    # Load environment variables from a file called .env
-    load_dotenv('environment_variables')
 
-    # Use getenv to retrieve values
+    # Load environment variables from a file called .env
+    load_dotenv('environment_variables.env')
+
+    # Now use getenv to safely retrieve values
     azure_openai_api_key = os.getenv("CLASS_AZURE_KEY")
     azure_openai_endpoint = os.getenv("SUBSCRIPTION_OPENAI_ENDPOINT")
     azure_openai_endpoint_4o = os.getenv("SUBSCRIPTION_OPENAI_ENDPOINT_4o")
-
-    required_env_vars = {
-        "CLASS_AZURE_KEY": azure_openai_api_key,
-        "SUBSCRIPTION_OPENAI_ENDPOINT": azure_openai_endpoint,
-        "SUBSCRIPTION_OPENAI_ENDPOINT_4o": azure_openai_endpoint_4o
-    }
-
-    missing_vars = [key for key, value in required_env_vars.items() if not value]
-
-    if missing_vars:
-        raise EnvironmentError(
-            f"Missing required environment variables: {', '.join(missing_vars)}.\n"
-            f"hw1.py expects 'environment_variables' file is within the current directory. \n"
-        )
 
     # --- Initialize Azure OpenAI clients for two models ---
     client_model1 = AzureOpenAI(
@@ -393,27 +353,23 @@ def main():
         azure_endpoint=azure_openai_endpoint_4o
     )
 
-    # --- Endpoints Connection Check ---
-    test_client_connection(client_model1, MODEL)
-    test_client_connection(client_model2, MODEL_4o)
+    test_client_connection(client_model1, "gpt-35-16k")
+    test_client_connection(client_model2, "gpt-4o-mini")
 
-    # --- Part 1 execution ---
-    ## Setting models configurations
-    print("Begins with part 1...")
+    # Part 1:
+    ## Each tuple = (model_name, temperature, associated_client)
     MODEL_TEMP_CONFIGS = [
         (MODEL, 0.0, client_model1),
         (MODEL_4o, 0.0, client_model2),
         (MODEL_4o, 0.9, client_model2)
     ]
 
-    tickets = load_tickets("tkts_1.txt")
+    tickets = load_tickets('1test.txt')
     split_results = generate_split_predictions(tickets, MODEL_TEMP_CONFIGS)
     write_split_results_to_file(split_results, "split.txt")
+    print(" split.txt has been created.")
 
-    print("Continues to part 2 now...")
-
-    # --- Part 2 execution ---
-    ## Setting models configurations
+    # Part 2:
     MODEL_TEMP_CATEGORY_CONFIGS = [
         (MODEL, 0.0, client_model1),
         (MODEL, 0.5, client_model1),
@@ -423,22 +379,21 @@ def main():
         (MODEL_4o, 0.9, client_model2)
     ]
 
-    tickets = load_tickets("tkts_2.txt")
-    category_results = generate_category_predictions(tickets, MODEL_TEMP_CATEGORY_CONFIGS)
+    tickets = load_tickets("2test.txt")
+    start_time = time.time()
+    category_results = generate_category_predictions_threaded(tickets,MODEL_TEMP_CATEGORY_CONFIGS
+                                                              ,max_workers=10)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"⏱️ Time taken for Part 2 (multithreaded): {elapsed_time:.2f} seconds")
     write_category_results_to_file(category_results, "categories.txt")
+    print("categories.txt has been created.")
 
-    print("Continues to part 3...")
-
-    # --- Part 3 execution ---
+    # Part 3:
     results = parse_categories_file("categories.txt")
     ticket_stats, temp_stats, model_stats, majority_correct, total_tickets = analyze_categories(results)
     write_statistics_to_file(ticket_stats, temp_stats, model_stats, majority_correct, total_tickets, "statistics.txt")
-    print("✅")
+    print("✅ statistics.txt created.")
 
 if __name__ == '__main__':
     main()
-
-
-
-
-
